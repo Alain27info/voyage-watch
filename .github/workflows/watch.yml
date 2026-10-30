@@ -1,0 +1,41 @@
+name: voyage-watch
+
+# Vérifie voyage.benin.bj toutes les 5 minutes (minimum autorisé par GitHub)
+# et envoie une alerte Telegram si la page "bientôt disponible" disparaît.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # bouton "Run workflow" pour tester à la main
+
+concurrency:
+  group: voyage-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      # Garde state.json d'une exécution à l'autre (sinon le script oublie
+      # qu'il a déjà alerté et renverrait un message à chaque passage).
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check site
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_FILE: state/state.json
+          CHECK_INTERVAL: "300"
+          MAX_ALERTS: "10"
+        run: |
+          mkdir -p state
+          python3 monitor.py --once
