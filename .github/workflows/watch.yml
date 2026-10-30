@@ -29,6 +29,14 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
+      - name: Debug secrets
+        env:
+          T: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          C: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          [ -n "$T" ] && echo "TOKEN: present (${#T} caracteres)" || echo "TOKEN: ABSENT"
+          [ -n "$C" ] && echo "CHAT_ID: present (${#C} caracteres)" || echo "CHAT_ID: ABSENT"
+
       - name: Check site
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
