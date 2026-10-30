@@ -1,12 +1,15 @@
 name: voyage-watch
 
-# Vérifie voyage.benin.bj toutes les 5 minutes (minimum autorisé par GitHub)
-# et envoie une alerte Telegram si la page "bientôt disponible" disparaît.
+# Chaque exécution surveille voyage.benin.bj en boucle (1 vérification par minute)
+# pendant ~55 minutes. Un déclencheur toutes les 10 minutes met en file la
+# suivante, qui démarre dès que la précédente se termine : la surveillance est
+# donc quasi continue.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: # bouton "Run workflow" pour tester à la main
 
+# Une seule exécution à la fois ; la suivante attend sans interrompre l'actuelle.
 concurrency:
   group: voyage-watch
   cancel-in-progress: false
@@ -17,33 +20,27 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      # Garde state.json d'une exécution à l'autre (sinon le script oublie
-      # qu'il a déjà alerté et renverrait un message à chaque passage).
+      # Garde state.json d'une exécution à l'autre.
       - uses: actions/cache@v4
         with:
           path: state
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Debug secrets
-        env:
-          T: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          C: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          [ -n "$T" ] && echo "TOKEN: present (${#T} caracteres)" || echo "TOKEN: ABSENT"
-          [ -n "$C" ] && echo "CHAT_ID: present (${#C} caracteres)" || echo "CHAT_ID: ABSENT"
-
-      - name: Check site
+      - name: Surveillance (boucle ~55 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state/state.json
-          CHECK_INTERVAL: "300"
-          MAX_ALERTS: "10"
+          CHECK_INTERVAL: "60"
+          MAX_ALERTS: "15"
+          HEARTBEAT_HOURS: "1" # message "Toujours actif" toutes les heures
         run: |
           mkdir -p state
-          python3 Monitor.py --once
+          # "|| true" : l'arrêt par timeout est normal, il ne doit pas
+          # faire échouer l'étape (sinon le cache ne serait pas sauvegardé).
+          timeout 3300 python3 Monitor.py || true
