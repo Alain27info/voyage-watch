@@ -38,4 +38,4 @@ jobs:
           MAX_ALERTS: "10"
         run: |
           mkdir -p state
-          python3 monitor.py --once
+          python3 Monitor.py --once
