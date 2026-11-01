@@ -1,12 +1,13 @@
 name: voyage-watch
 
-# Chaque exécution surveille voyage.benin.bj en boucle (1 vérification par minute)
-# pendant ~55 minutes. Un déclencheur toutes les 10 minutes met en file la
-# suivante, qui démarre dès que la précédente se termine : la surveillance est
-# donc quasi continue.
+# Chaque exécution surveille voyage.benin.bj en boucle (1 vérification toutes
+# les 30 s) pendant ~55 minutes. À la fin, le run se relance lui-même
+# (dernière étape) : la surveillance est donc quasi continue. Le cron n'est
+# qu'un filet de sécurité si la chaîne se rompt.
+# Pour arrêter : variable de dépôt WATCH_ENABLED = false, puis "Cancel workflow".
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch: # bouton "Run workflow" pour tester à la main
 
 # Une seule exécution à la fois ; la suivante attend sans interrompre l'actuelle.
@@ -16,16 +17,18 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write # nécessaire pour que le run se relance lui-même
 
 jobs:
   check:
+    if: ${{ vars.WATCH_ENABLED != 'false' }} # interrupteur d'arrêt
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      # Garde state.json d'une exécution à l'autre.
-      - uses: actions/cache@v4
+      # Récupère state.json de l'exécution précédente.
+      - uses: actions/cache/restore@v4
         with:
           path: state
           key: state-${{ github.run_id }}
@@ -36,11 +39,27 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_FILE: state/state.json
-          CHECK_INTERVAL: "60"
-          MAX_ALERTS: "15"
+          CHECK_INTERVAL: "30"
+          MAX_ALERTS: "20"
           HEARTBEAT_HOURS: "1" # message "Toujours actif" toutes les heures
         run: |
           mkdir -p state
           # "|| true" : l'arrêt par timeout est normal, il ne doit pas
-          # faire échouer l'étape (sinon le cache ne serait pas sauvegardé).
+          # faire échouer l'étape.
           timeout 3300 python3 Monitor.py || true
+
+      # Sauvegarde l'état même si le run est annulé à la main.
+      - name: Sauvegarde de l'état
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+
+      # Met en file le run suivant (démarre dès que celui-ci se termine).
+      # Pas de relance si le run est annulé ou si WATCH_ENABLED = false.
+      - name: Relance du run suivant
+        if: ${{ !cancelled() && vars.WATCH_ENABLED != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
