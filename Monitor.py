@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-voyage-watch: alerts you on Telegram when https://www.voyage.benin.bj/ stops
-showing its "Bientôt disponible" placeholder (i.e. special flights open).
+voyage-watch: alerts you on Telegram when https://www.voyage.benin.bj/ changes.
+
+Two kinds of alerts:
+  1. OPENING   - the "sera bientôt disponible" placeholder disappears or the site
+                 redirects elsewhere (repeated up to MAX_ALERTS times).
+  2. NEW CONTENT - the visible text or the links of the page change (e.g. new flight
+                 dates), even if the placeholder phrase is still there, and even after
+                 the site has opened. Confirmed over CONFIRM_CHECKS consecutive checks
+                 to avoid false alarms. Disable with CONTENT_WATCH=0.
 
 Standard library only, no pip install needed. Python 3.8+.
 
@@ -12,11 +19,11 @@ Usage:
   python3 monitor.py --test       # send a test message to Telegram
   python3 monitor.py --chat-id    # print the chat IDs that messaged your bot
 """
+import hashlib
 import html
 import json
 import os
 import re
-import ssl
 import sys
 import time
 import unicodedata
@@ -44,20 +51,19 @@ def load_env():
 
 load_env()
 
-URL = os.environ.get("WATCH_URL", "https://voyage.benin.bj/")
+URL = os.environ.get("WATCH_URL", "https://www.voyage.benin.bj/")
 # Text that is only present while the placeholder page is up (accent-insensitive).
 MARKER = os.environ.get("PLACEHOLDER_MARKER", "sera bientot disponible")
 INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL", "60")))  # never faster than 30s
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(HERE / "state.json")))
-MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "5"))            # repeats once the site changes
+MAX_ALERTS = int(os.environ.get("MAX_ALERTS", "5"))            # repeats once the site opens
 ERROR_THRESHOLD = int(os.environ.get("ERROR_THRESHOLD", "5"))  # consecutive failures before warning
 HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "24"))  # 0 disables
-# Set to 1 if the site's TLS chain is broken/expired (only used for the page check, never Telegram).
-INSECURE_SSL = os.environ.get("INSECURE_SSL", "0") == "1"
-NOTIFY_EVERY_CHECK = os.environ.get("NOTIFY_EVERY_CHECK", "0") == "1"  # test mode: Telegram message on every check
-USER_AGENT = os.environ.get("USER_AGENT", "voyage-watch/1.0 (personal flight-opening alert)")
+CONTENT_WATCH = os.environ.get("CONTENT_WATCH", "1") != "0"    # alert on any content change
+CONFIRM_CHECKS = max(1, int(os.environ.get("CONFIRM_CHECKS", "2")))  # same new content N times in a row
+USER_AGENT = os.environ.get("USER_AGENT", "voyage-watch/1.1 (personal flight-opening alert)")
 
 
 def log(msg):
@@ -72,22 +78,12 @@ def norm(text):
 
 # --------------------------------------------------------------------------- fetch
 
-def _ssl_context():
-    """Use certifi's CA bundle when installed (fixes 'certificate has expired' chain errors)."""
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        return None
-
-
 def fetch(url):
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5"}
     )
     try:
-        ctx = ssl._create_unverified_context() if INSECURE_SSL else _ssl_context()
-        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read(2_000_000).decode(charset, "replace")
             return {"status": resp.status, "final_url": resp.geturl(), "body": body, "error": None}
@@ -121,6 +117,53 @@ def analyse(r, url=URL, marker=MARKER):
     return "changed", title or "page modifiée"
 
 
+# --------------------------------------------------------------------------- page content
+
+_BLOCK = re.compile(
+    r"</?(?:p|div|br|li|ul|ol|tr|td|th|table|section|article|header|footer|main|nav|"
+    r"h[1-6]|form|button|label|option|dd|dt|hr)\b[^>]*>",
+    re.I,
+)
+
+
+def page_lines(body):
+    """Stable fingerprint material: title + visible text lines + link targets.
+
+    Scripts, styles, comments, <head> metadata and hidden inputs are ignored, as are
+    query strings in links, so tokens/nonces/cache-busters do not trigger alerts.
+    """
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    lines = []
+    if m:
+        lines.append("Titre : " + html.unescape(m.group(1)))
+    t = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
+    t = re.sub(r"<(script|style|noscript|template|svg|head)\b.*?</\1\s*>", " ", t, flags=re.S | re.I)
+    links = set()
+    for href in re.findall(r"""href\s*=\s*["']([^"']+)["']""", t, re.I):
+        href = href.strip()
+        if not href or href.startswith(("#", "javascript:")):
+            continue
+        links.add(href.split("#")[0].split("?")[0])
+    t = _BLOCK.sub("\n", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = html.unescape(t)
+    for line in t.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    lines.extend("Lien : " + h for h in sorted(links))
+    return lines
+
+
+def fingerprint(lines):
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def added_lines(old, new):
+    seen = set(old)
+    return [l for l in new if l not in seen]
+
+
 # --------------------------------------------------------------------------- telegram
 
 def tg(method, **params):
@@ -138,7 +181,7 @@ def notify(text):
     for chat_id in CHAT_IDS:
         for attempt in range(3):
             try:
-                tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview="true")
+                tg("sendMessage", chat_id=chat_id, text=text[:4000], disable_web_page_preview="true")
                 break
             except Exception as e:
                 log(f"Telegram erreur (essai {attempt + 1}/3) : {e}")
@@ -172,15 +215,38 @@ def load_state():
 
 
 def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state))
+
+
+def adopt(state, fp, lines):
+    """Make this page content the new reference."""
+    state["fp"] = fp
+    state["lines"] = lines[:300]
+    state["pending_fp"] = None
+    state["pending_n"] = 0
+
+
+def content_message(label, old_lines, new_lines):
+    added = added_lines(old_lines, new_lines)
+    head = (
+        "🆕 Le contenu du site a changé (la mention « bientôt disponible » est toujours là)."
+        if label == "placeholder"
+        else "🆕 Nouveau contenu sur le site."
+    )
+    if added:
+        shown = [("• " + l[:160]) for l in added[:8]]
+        more = f"\n(+ {len(added) - 8} autres lignes)" if len(added) > 8 else ""
+        body = "Ajouté :\n" + "\n".join(shown) + more
+    else:
+        body = "Des éléments ont été retirés ou modifiés sur la page."
+    return f"{head}\n{body}\n👉 {URL}"
 
 
 def step(state):
     r = fetch(URL)
     label, detail = analyse(r)
     log(f"{label} | {detail}")
-    if NOTIFY_EVERY_CHECK:
-        notify(f"🔎 Test : {label} | {detail}")
 
     if label == "error":
         state["errors"] += 1
@@ -197,6 +263,8 @@ def step(state):
     state["errors"] = 0
 
     previous = state.get("label")
+    label_changed = previous is not None and label != previous
+
     if label == "placeholder":
         if previous is None:
             notify(f"👀 Surveillance démarrée. État actuel : page « bientôt disponible ». Contrôle toutes les {INTERVAL}s.")
@@ -211,6 +279,26 @@ def step(state):
                 f"({detail})\n👉 {URL}\n(alerte {n}/{MAX_ALERTS})"
             )
             state["alerts_sent"] = n
+
+    if CONTENT_WATCH:
+        lines = page_lines(r["body"])
+        fp = fingerprint(lines)
+        confirmed = state.get("fp")
+        if confirmed is None or previous is None or label_changed:
+            # first run, old state file, or an opening/closing already announced above
+            adopt(state, fp, lines)
+        elif fp != confirmed:
+            if state.get("pending_fp") == fp:
+                state["pending_n"] = state.get("pending_n", 0) + 1
+            else:
+                state["pending_fp"], state["pending_n"] = fp, 1
+            log(f"contenu différent ({state['pending_n']}/{CONFIRM_CHECKS})")
+            if state["pending_n"] >= CONFIRM_CHECKS:
+                notify(content_message(label, state.get("lines", []), lines))
+                adopt(state, fp, lines)
+        else:
+            state["pending_fp"], state["pending_n"] = None, 0
+
     state["label"] = label
 
 
@@ -218,7 +306,14 @@ def heartbeat(state):
     if HEARTBEAT_HOURS <= 0:
         return
     if time.time() - state.get("last_heartbeat", 0) >= HEARTBEAT_HOURS * 3600:
-        notify(f"💚 Toujours actif. État actuel : {state.get('label')}.")
+        label = state.get("label")
+        if label == "placeholder":
+            status = "Le site affiche toujours « bientôt disponible »."
+        elif label == "changed":
+            status = "La page du site a changé : vérifie-la."
+        else:
+            status = "Pas encore de vérification réussie."
+        notify(f"💚 Toujours actif. {status}")
         state["last_heartbeat"] = time.time()
 
 
@@ -229,8 +324,13 @@ def main():
     if "--test" in args:
         return notify("✅ Test : le bot Telegram fonctionne.")
     if "--check" in args:
-        label, detail = analyse(fetch(URL))
+        r = fetch(URL)
+        label, detail = analyse(r)
         print(f"{label} | {detail}")
+        if not r["error"]:
+            print("--- contenu surveillé (aperçu) ---")
+            for line in page_lines(r["body"])[:15]:
+                print(" ", line[:120])
         return
     state = load_state()
     if "--once" in args:
