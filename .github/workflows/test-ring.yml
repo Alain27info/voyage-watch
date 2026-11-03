@@ -1,0 +1,54 @@
+name: test-ring
+
+# Test manuel de la sonnerie : envoie un faux message Telegram et fait sonner
+# le téléphone (Monitor.py --simulate) avec les mêmes secrets que la surveillance.
+# N'utilise pas le cache : l'état de la surveillance n'est pas touché.
+# Lancer depuis Actions > test-ring > Run workflow. Le job est rouge si l'appel échoue.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: test-ring
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Faux déclenchement (Telegram + sonnerie)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_FILE: ring-test-state.json
+          RING_TARGETS: ${{ secrets.RING_TARGETS }}
+          RING_SECONDS: "20"
+          RING_MAX_PER_DAY: "6"
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          TG_RINGER_HOME: ${{ runner.temp }}/tg-ringer
+        run: |
+          mkdir -p "$TG_RINGER_HOME"
+          python -m pip install --quiet tg-ringer certifi
+          if [ -z "$TG_SESSION_B64" ]; then
+            echo "::error::Secret TG_SESSION_B64 manquant ou vide"
+            exit 1
+          fi
+          echo "$TG_SESSION_B64" | base64 -d > "$TG_RINGER_HOME/userbot.session"
+          export TG_SESSION="$TG_RINGER_HOME/userbot.session"
+          python3 Monitor.py --simulate 2>&1 | tee ring-test.log
+          # Succès seulement si l'appel a réellement abouti (code retour 0).
+          grep -q "Appel .* : code 0" ring-test.log || {
+            echo "::error::La sonnerie a échoué : voir le log ci-dessus"
+            exit 1
+          }
