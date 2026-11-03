@@ -28,6 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python géré par GitHub : permet d'installer tg-ringer (sonnerie téléphone).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # Récupère state.json de l'exécution précédente.
       - uses: actions/cache/restore@v4
         with:
@@ -43,8 +48,23 @@ jobs:
           CHECK_INTERVAL: "30"
           MAX_ALERTS: "20"
           HEARTBEAT_HOURS: "1" # message "Toujours actif" toutes les heures
+          # --- Sonnerie téléphone via tg-ringer (compte userbot) ---
+          RING_TARGETS: ${{ secrets.RING_TARGETS }}
+          RING_SECONDS: "45"
+          RING_ALERTS: "2" # sonne seulement sur les 2 premières alertes d'ouverture
+          RING_MAX_PER_DAY: "6" # plafond d'appels par 24 h
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }} # fichier .session encodé en base64
+          TG_RINGER_HOME: ${{ runner.temp }}/tg-ringer
         run: |
-          mkdir -p state
+          mkdir -p state "$TG_RINGER_HOME"
+          # Si l'installation échoue, la surveillance continue (sans sonnerie).
+          python -m pip install --quiet tg-ringer certifi || echo "tg-ringer non installé : pas de sonnerie"
+          if [ -n "$TG_SESSION_B64" ]; then
+            echo "$TG_SESSION_B64" | base64 -d > "$TG_RINGER_HOME/userbot.session"
+            export TG_SESSION="$TG_RINGER_HOME/userbot.session"
+          fi
           # "|| true" : l'arrêt par timeout est normal, il ne doit pas
           # faire échouer l'étape.
           timeout 3300 python3 Monitor.py || true
