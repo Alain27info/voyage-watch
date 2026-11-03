@@ -1,0 +1,103 @@
+name: test-scenario
+
+# Test de bout en bout, sans toucher à la vraie surveillance : un faux site local
+# passe de "bientôt disponible" à "nouveau contenu" puis à "réservations ouvertes".
+# Le vrai Monitor.py tourne dessus et envoie les VRAIS messages Telegram + sonneries
+# (début, 🆕 nouveau contenu, 🚨 ouverture x2). Durée : environ 3 à 5 minutes.
+# Lancer depuis Actions > test-scenario > Run workflow. Rouge si un message manque.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: test-scenario
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scénario complet (faux site local)
+        env:
+          WATCH_URL: http://127.0.0.1:8000/
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATE_FILE: test-scenario-state.json
+          CHECK_INTERVAL: "30"
+          HEARTBEAT_HOURS: "0"
+          MAX_ALERTS: "2"
+          RING_TARGETS: ${{ secrets.RING_TARGETS }}
+          RING_SECONDS: "20"
+          RING_ALERTS: "1"
+          RING_MAX_PER_DAY: "6"
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
+          TG_RINGER_HOME: ${{ runner.temp }}/tg-ringer
+        run: |
+          mkdir -p "$TG_RINGER_HOME" site
+          python -m pip install --quiet tg-ringer certifi
+          if [ -z "$TG_SESSION_B64" ]; then
+            echo "::error::Secret TG_SESSION_B64 manquant ou vide"
+            exit 1
+          fi
+          echo "$TG_SESSION_B64" | base64 -d > "$TG_RINGER_HOME/userbot.session"
+          export TG_SESSION="$TG_RINGER_HOME/userbot.session"
+
+          # Page "bientôt disponible" ($1 = contenu ajouté éventuel).
+          page_attente() {
+            printf '%s\n' '<html><head><title>Charter — Bénin Tours S.A. | Bientôt disponible</title></head><body>' '<h1>Charter — Bénin Tours S.A.</h1>' '<p>Le site sera bientôt disponible</p>' "$1" '</body></html>' > site/index.html
+          }
+          # Attend qu'un texte apparaisse dans monitor.log ($1 = texte, $2 = essais de 2 s).
+          wait_for() {
+            for i in $(seq 1 "$2"); do
+              grep -qF "$1" monitor.log && return 0
+              sleep 2
+            done
+            return 1
+          }
+
+          page_attente ''
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory site > /dev/null 2>&1 &
+          sleep 2
+
+          python3 -c "import Monitor; Monitor.notify('🧪 TEST automatique : scénario complet sur un faux site local. Les messages qui suivent sont simulés.')"
+
+          python3 Monitor.py > monitor.log 2>&1 &
+          MON=$!
+
+          echo "== 1) Démarrage : page 'bientôt disponible' =="
+          wait_for "NOTIFY: 👀" 60 || echo "(délai dépassé)"
+
+          echo "== 2) Un vol est ajouté, le texte 'bientôt disponible' reste =="
+          page_attente '<p>Vol Paris - Cotonou : 20 décembre 2026</p><a href="/reservation">Réserver</a>'
+          wait_for "NOTIFY: 🆕" 100 || echo "(délai dépassé)"
+
+          echo "== 3) Le site ouvre : 'bientôt disponible' disparaît =="
+          printf '%s\n' '<html><head><title>Charter — Bénin Tours S.A. | Réservations ouvertes</title></head><body>' '<h1>Réservations ouvertes</h1>' '<p>Vol Paris - Cotonou : 20 décembre 2026</p>' '<a href="/reservation">Réserver</a>' '</body></html>' > site/index.html
+          wait_for "alerte 2/2" 100 || echo "(délai dépassé)"
+
+          sleep 3
+          kill "$MON" 2>/dev/null || true
+          python3 -c "import Monitor; Monitor.notify('🧪 Fin du test : tout ce qui précède était simulé.')"
+
+          echo "================ Journal du moniteur ================"
+          cat monitor.log
+
+          fail=0
+          for p in "NOTIFY: 👀" "NOTIFY: 🆕" "alerte 1/2" "alerte 2/2"; do
+            grep -qF "$p" monitor.log || { echo "::error::Message attendu absent : $p"; fail=1; }
+          done
+          rings=$(grep -c "Appel .* : code 0" monitor.log || true)
+          echo "Appels réussis : $rings (attendu : 2)"
+          [ "$rings" -ge 2 ] || { echo "::error::La sonnerie devait aboutir 2 fois"; fail=1; }
+          exit $fail
