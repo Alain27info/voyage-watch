@@ -24,6 +24,8 @@ import html
 import json
 import os
 import re
+import ssl
+import subprocess
 import sys
 import time
 import unicodedata
@@ -63,6 +65,11 @@ ERROR_THRESHOLD = int(os.environ.get("ERROR_THRESHOLD", "5"))  # consecutive fai
 HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "24"))  # 0 disables
 CONTENT_WATCH = os.environ.get("CONTENT_WATCH", "1") != "0"    # alert on any content change
 CONFIRM_CHECKS = max(1, int(os.environ.get("CONFIRM_CHECKS", "2")))  # same new content N times in a row
+# Phone ring via tg-ringer (userbot account, see `python -m tg_ringer.cli login`).
+RING_TARGETS = [t.strip() for t in os.environ.get("RING_TARGETS", "").split(",") if t.strip()]
+RING_SECONDS = int(os.environ.get("RING_SECONDS", "45"))
+RING_ALERTS = int(os.environ.get("RING_ALERTS", "2"))          # ring only on the first N alerts of an opening
+RING_MAX_PER_DAY = int(os.environ.get("RING_MAX_PER_DAY", "6"))  # hard cap per target (protects the account)
 USER_AGENT = os.environ.get("USER_AGENT", "voyage-watch/1.1 (personal flight-opening alert)")
 
 
@@ -78,12 +85,21 @@ def norm(text):
 
 # --------------------------------------------------------------------------- fetch
 
+def _ssl_context():
+    """Use certifi's CA bundle when installed (fixes 'certificate has expired' chain errors)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return None
+
+
 def fetch(url):
     req = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             body = resp.read(2_000_000).decode(charset, "replace")
             return {"status": resp.status, "final_url": resp.geturl(), "body": body, "error": None}
@@ -188,6 +204,30 @@ def notify(text):
                 time.sleep(2)
 
 
+def ring(state):
+    """Make each RING_TARGETS phone ring (Telegram call via tg-ringer), within a daily cap."""
+    now = time.time()
+    rings = state.setdefault("rings", {})
+    for target in RING_TARGETS:
+        recent = [t for t in rings.get(target, []) if now - t < 86400]
+        if len(recent) >= RING_MAX_PER_DAY:
+            log(f"Appel {target} ignoré : plafond de {RING_MAX_PER_DAY}/24h atteint")
+            rings[target] = recent
+            continue
+        try:
+            res = subprocess.run(
+                [sys.executable, "-m", "tg_ringer.cli", "call", target, "--seconds", str(RING_SECONDS)],
+                capture_output=True, text=True, timeout=RING_SECONDS + 60,
+            )
+            out = (res.stdout + res.stderr).strip().splitlines()
+            log(f"Appel {target} : code {res.returncode} | {out[-1] if out else ''}")
+            if res.returncode == 0:
+                recent.append(now)
+        except Exception as e:
+            log(f"Appel {target} échoué : {e}")
+        rings[target] = recent
+
+
 def print_chat_ids():
     if not TOKEN:
         sys.exit("Mets d'abord TELEGRAM_BOT_TOKEN dans .env")
@@ -279,6 +319,8 @@ def step(state):
                 f"({detail})\n👉 {URL}\n(alerte {n}/{MAX_ALERTS})"
             )
             state["alerts_sent"] = n
+            if n <= RING_ALERTS:
+                ring(state)
 
     if CONTENT_WATCH:
         lines = page_lines(r["body"])
@@ -295,6 +337,7 @@ def step(state):
             log(f"contenu différent ({state['pending_n']}/{CONFIRM_CHECKS})")
             if state["pending_n"] >= CONFIRM_CHECKS:
                 notify(content_message(label, state.get("lines", []), lines))
+                ring(state)
                 adopt(state, fp, lines)
         else:
             state["pending_fp"], state["pending_n"] = None, 0
@@ -323,6 +366,16 @@ def main():
         return print_chat_ids()
     if "--test" in args:
         return notify("✅ Test : le bot Telegram fonctionne.")
+    if "--simulate" in args:
+        # Same path as a real opening: Telegram message + phone ring. Doesn't touch the saved page state.
+        state = load_state()
+        notify(
+            "🧪 SIMULATION (fausse alerte) : 🚨 LA PAGE A CHANGÉ : les vols Paris-Cotonou ouvrent "
+            f"peut-être !\n👉 {URL}\n(ceci est un test)"
+        )
+        ring(state)
+        save_state(state)
+        return
     if "--check" in args:
         r = fetch(URL)
         label, detail = analyse(r)
